@@ -1,0 +1,43 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#",
+  "contentVersion": "1.0.0.0",
+  "parameters": {
+    "environment": {
+      "value": "prod"
+    },
+    "location": {
+      "value": "eastus"
+    },
+    "uniqueSuffix": {
+      "value": "abc01"
+    },
+    "tenantId": {
+      "value": "<YOUR-TENANT-ID>"
+    },
+    "spClientId": {
+      "value": "<YOUR-SERVICE-PRINCIPAL-CLIENT-ID>"
+    },
+    "spClientSecret": {
+      "reference": {
+        "keyVault": {
+          "id": "/subscriptions/<SUB-ID>/resourceGroups/<RG>/providers/Microsoft.KeyVault/vaults/<EXISTING-KV>"
+        },
+        "secretName": "sp-client-secret"
+      }
+    },
+    "anthropicApiKey": {
+      "reference": {
+        "keyVault": {
+          "id": "/subscriptions/<SUB-ID>/resourceGroups/<RG>/providers/Microsoft.KeyVault/vaults/<EXISTING-KV>"
+        },
+        "secretName": "anthropic-api-key"
+      }
+    },
+    "monitoredSubscriptionId": {
+      "value": "<YOUR-SUBSCRIPTION-ID>"
+    },
+    "deployerObjectId": {
+      "value": "<YOUR-AAD-OBJECT-ID>"
+    }
+  }
+}
