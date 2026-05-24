@@ -1,7 +1,7 @@
 {
-  "name": "azure-vm-health-api",
+  "name": "azure-vm-health-infra",
   "version": "1.0.0",
-  "description": "Azure VM Health Assistant — Function App Backend",
+  "description": "Azure VM Health Assistant — Infrastructure + Function App Backend",
   "main": "index.js",
   "scripts": {
     "start": "func start",
@@ -11,6 +11,7 @@
   "dependencies": {
     "@azure/arm-compute": "^21.3.0",
     "@azure/arm-monitor": "^7.0.0",
+    "@azure/arm-alertsmanagement": "^2.0.0",
     "@azure/arm-resources": "^5.2.0",
     "@azure/identity": "^4.2.1"
   },

@@ -1,0 +1,614 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+  "contentVersion": "1.0.0.0",
+  "metadata": {
+    "_generator": {
+      "name": "bicep",
+      "version": "0.43.8.12551",
+      "templateHash": "4994463509339341442"
+    }
+  },
+  "parameters": {
+    "environment": {
+      "type": "string",
+      "defaultValue": "prod",
+      "allowedValues": [
+        "dev",
+        "staging",
+        "prod"
+      ],
+      "metadata": {
+        "description": "Environment name (dev, staging, prod)"
+      }
+    },
+    "location": {
+      "type": "string",
+      "defaultValue": "[resourceGroup().location]",
+      "metadata": {
+        "description": "Azure region for all resources"
+      }
+    },
+    "uniqueSuffix": {
+      "type": "string",
+      "minLength": 3,
+      "maxLength": 6,
+      "metadata": {
+        "description": "Unique suffix to make resource names globally unique (3-6 chars)"
+      }
+    },
+    "tenantId": {
+      "type": "string",
+      "defaultValue": "[tenant().tenantId]",
+      "metadata": {
+        "description": "Azure AD Tenant ID for the service principal"
+      }
+    },
+    "spClientId": {
+      "type": "string",
+      "metadata": {
+        "description": "Service principal Client ID (App Registration)"
+      }
+    },
+    "spClientSecret": {
+      "type": "securestring",
+      "metadata": {
+        "description": "Service principal Client Secret — stored securely in Key Vault"
+      }
+    },
+    "monitoredSubscriptionId": {
+      "type": "string",
+      "defaultValue": "[subscription().subscriptionId]",
+      "metadata": {
+        "description": "Azure Subscription ID to monitor"
+      }
+    },
+    "anthropicApiKey": {
+      "type": "securestring",
+      "metadata": {
+        "description": "Anthropic API key for Claude AI integration"
+      }
+    },
+    "deployerObjectId": {
+      "type": "string",
+      "metadata": {
+        "description": "Object ID of the deploying user/SP — for Key Vault admin during setup"
+      }
+    },
+    "alertEmailAddresses": {
+      "type": "array",
+      "defaultValue": [],
+      "metadata": {
+        "description": "Email addresses for alert notifications (optional). Example: [\"admin@contoso.com\", \"ops@contoso.com\"]"
+      }
+    },
+    "webhookUrl": {
+      "type": "string",
+      "defaultValue": "",
+      "metadata": {
+        "description": "Webhook URL for alert notifications (optional). Leave empty to skip webhook receiver."
+      }
+    },
+    "staticWebAppHostnameForCors": {
+      "type": "string",
+      "defaultValue": "",
+      "metadata": {
+        "description": "Static Web App hostname for CORS (optional). Leave empty to use wildcard; update post-deploy via deploy.sh"
+      }
+    }
+  },
+  "variables": {
+    "appName": "vmhealth",
+    "prefix": "[format('{0}-{1}-{2}', variables('appName'), parameters('environment'), parameters('uniqueSuffix'))]",
+    "tags": {
+      "application": "AzureVMHealthAssistant",
+      "environment": "[parameters('environment')]",
+      "managedBy": "Bicep"
+    },
+    "webhookReceivers": "[if(empty(parameters('webhookUrl')), createArray(), createArray(createObject('name', 'FunctionWebhook', 'serviceUri', parameters('webhookUrl'), 'useCommonAlertSchema', true())))]",
+    "emailReceivers": "[map(parameters('alertEmailAddresses'), lambda('email', createObject('name', split(lambdaVariables('email'), '@')[0], 'emailAddress', lambdaVariables('email'), 'useCommonAlertSchema', true())))]",
+    "corsAllowedOrigins": "[if(empty(parameters('staticWebAppHostnameForCors')), createArray('*', 'http://localhost:3000'), createArray(format('https://{0}', parameters('staticWebAppHostnameForCors')), 'http://localhost:3000'))]"
+  },
+  "resources": [
+    {
+      "type": "Microsoft.OperationalInsights/workspaces",
+      "apiVersion": "2022-10-01",
+      "name": "[format('law-{0}', variables('prefix'))]",
+      "location": "[parameters('location')]",
+      "tags": "[variables('tags')]",
+      "properties": {
+        "sku": {
+          "name": "PerGB2018"
+        },
+        "retentionInDays": 30,
+        "features": {
+          "enableLogAccessUsingOnlyResourcePermissions": true
+        }
+      }
+    },
+    {
+      "type": "Microsoft.Insights/components",
+      "apiVersion": "2020-02-02",
+      "name": "[format('ai-{0}', variables('prefix'))]",
+      "location": "[parameters('location')]",
+      "tags": "[variables('tags')]",
+      "kind": "web",
+      "properties": {
+        "Application_Type": "web",
+        "WorkspaceResourceId": "[resourceId('Microsoft.OperationalInsights/workspaces', format('law-{0}', variables('prefix')))]",
+        "RetentionInDays": 30,
+        "publicNetworkAccessForIngestion": "Enabled",
+        "publicNetworkAccessForQuery": "Enabled"
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.OperationalInsights/workspaces', format('law-{0}', variables('prefix')))]"
+      ]
+    },
+    {
+      "type": "Microsoft.KeyVault/vaults",
+      "apiVersion": "2023-02-01",
+      "name": "[format('kv-{0}', variables('prefix'))]",
+      "location": "[parameters('location')]",
+      "tags": "[variables('tags')]",
+      "properties": {
+        "sku": {
+          "family": "A",
+          "name": "standard"
+        },
+        "tenantId": "[parameters('tenantId')]",
+        "enableRbacAuthorization": true,
+        "enableSoftDelete": true,
+        "softDeleteRetentionInDays": 30,
+        "enabledForDeployment": false,
+        "enabledForTemplateDeployment": false,
+        "publicNetworkAccess": "Enabled",
+        "networkAcls": {
+          "defaultAction": "Allow",
+          "bypass": "AzureServices"
+        }
+      }
+    },
+    {
+      "type": "Microsoft.Authorization/roleAssignments",
+      "apiVersion": "2022-04-01",
+      "scope": "[resourceId('Microsoft.KeyVault/vaults', format('kv-{0}', variables('prefix')))]",
+      "name": "[guid(resourceId('Microsoft.KeyVault/vaults', format('kv-{0}', variables('prefix'))), parameters('deployerObjectId'), 'kv-admin')]",
+      "properties": {
+        "roleDefinitionId": "[subscriptionResourceId('Microsoft.Authorization/roleDefinitions', '00482a5a-887f-4fb3-b363-3b7fe8e74483')]",
+        "principalId": "[parameters('deployerObjectId')]",
+        "principalType": "User"
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.KeyVault/vaults', format('kv-{0}', variables('prefix')))]"
+      ]
+    },
+    {
+      "type": "Microsoft.Storage/storageAccounts",
+      "apiVersion": "2023-01-01",
+      "name": "[format('st{0}{1}{2}', variables('appName'), parameters('environment'), parameters('uniqueSuffix'))]",
+      "location": "[parameters('location')]",
+      "tags": "[variables('tags')]",
+      "sku": {
+        "name": "Standard_LRS"
+      },
+      "kind": "StorageV2",
+      "properties": {
+        "supportsHttpsTrafficOnly": true,
+        "minimumTlsVersion": "TLS1_2",
+        "allowBlobPublicAccess": false,
+        "accessTier": "Hot"
+      }
+    },
+    {
+      "type": "Microsoft.KeyVault/vaults/secrets",
+      "apiVersion": "2023-02-01",
+      "name": "[format('{0}/{1}', format('kv-{0}', variables('prefix')), 'sp-client-secret')]",
+      "properties": {
+        "value": "[parameters('spClientSecret')]",
+        "attributes": {
+          "enabled": true
+        }
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.KeyVault/vaults', format('kv-{0}', variables('prefix')))]",
+        "[extensionResourceId(resourceId('Microsoft.KeyVault/vaults', format('kv-{0}', variables('prefix'))), 'Microsoft.Authorization/roleAssignments', guid(resourceId('Microsoft.KeyVault/vaults', format('kv-{0}', variables('prefix'))), parameters('deployerObjectId'), 'kv-admin'))]"
+      ]
+    },
+    {
+      "type": "Microsoft.KeyVault/vaults/secrets",
+      "apiVersion": "2023-02-01",
+      "name": "[format('{0}/{1}', format('kv-{0}', variables('prefix')), 'anthropic-api-key')]",
+      "properties": {
+        "value": "[parameters('anthropicApiKey')]",
+        "attributes": {
+          "enabled": true
+        }
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.KeyVault/vaults', format('kv-{0}', variables('prefix')))]",
+        "[extensionResourceId(resourceId('Microsoft.KeyVault/vaults', format('kv-{0}', variables('prefix'))), 'Microsoft.Authorization/roleAssignments', guid(resourceId('Microsoft.KeyVault/vaults', format('kv-{0}', variables('prefix'))), parameters('deployerObjectId'), 'kv-admin'))]"
+      ]
+    },
+    {
+      "type": "Microsoft.KeyVault/vaults/secrets",
+      "apiVersion": "2023-02-01",
+      "name": "[format('{0}/{1}', format('kv-{0}', variables('prefix')), 'sp-client-id')]",
+      "properties": {
+        "value": "[parameters('spClientId')]",
+        "attributes": {
+          "enabled": true
+        }
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.KeyVault/vaults', format('kv-{0}', variables('prefix')))]",
+        "[extensionResourceId(resourceId('Microsoft.KeyVault/vaults', format('kv-{0}', variables('prefix'))), 'Microsoft.Authorization/roleAssignments', guid(resourceId('Microsoft.KeyVault/vaults', format('kv-{0}', variables('prefix'))), parameters('deployerObjectId'), 'kv-admin'))]"
+      ]
+    },
+    {
+      "type": "Microsoft.KeyVault/vaults/secrets",
+      "apiVersion": "2023-02-01",
+      "name": "[format('{0}/{1}', format('kv-{0}', variables('prefix')), 'storage-content-connection')]",
+      "properties": {
+        "value": "[format('DefaultEndpointsProtocol=https;AccountName={0};AccountKey={1};EndpointSuffix=core.windows.net', format('st{0}{1}{2}', variables('appName'), parameters('environment'), parameters('uniqueSuffix')), listKeys(resourceId('Microsoft.Storage/storageAccounts', format('st{0}{1}{2}', variables('appName'), parameters('environment'), parameters('uniqueSuffix'))), '2023-01-01').keys[0].value)]",
+        "attributes": {
+          "enabled": true
+        }
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.KeyVault/vaults', format('kv-{0}', variables('prefix')))]",
+        "[extensionResourceId(resourceId('Microsoft.KeyVault/vaults', format('kv-{0}', variables('prefix'))), 'Microsoft.Authorization/roleAssignments', guid(resourceId('Microsoft.KeyVault/vaults', format('kv-{0}', variables('prefix'))), parameters('deployerObjectId'), 'kv-admin'))]",
+        "[resourceId('Microsoft.Storage/storageAccounts', format('st{0}{1}{2}', variables('appName'), parameters('environment'), parameters('uniqueSuffix')))]"
+      ]
+    },
+    {
+      "type": "Microsoft.Web/serverfarms",
+      "apiVersion": "2023-01-01",
+      "name": "[format('asp-{0}', variables('prefix'))]",
+      "location": "[parameters('location')]",
+      "tags": "[variables('tags')]",
+      "sku": {
+        "name": "Y1",
+        "tier": "Dynamic"
+      },
+      "kind": "functionapp",
+      "properties": {
+        "reserved": true
+      }
+    },
+    {
+      "type": "Microsoft.Web/sites",
+      "apiVersion": "2023-01-01",
+      "name": "[format('func-{0}', variables('prefix'))]",
+      "location": "[parameters('location')]",
+      "tags": "[variables('tags')]",
+      "kind": "functionapp,linux",
+      "identity": {
+        "type": "SystemAssigned"
+      },
+      "properties": {
+        "serverFarmId": "[resourceId('Microsoft.Web/serverfarms', format('asp-{0}', variables('prefix')))]",
+        "httpsOnly": true,
+        "siteConfig": {
+          "linuxFxVersion": "Node|20",
+          "functionAppScaleLimit": 20,
+          "minTlsVersion": "1.2",
+          "ftpsState": "Disabled",
+          "http20Enabled": true,
+          "cors": {
+            "allowedOrigins": "[variables('corsAllowedOrigins')]",
+            "supportCredentials": false
+          }
+        }
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.Web/serverfarms', format('asp-{0}', variables('prefix')))]"
+      ]
+    },
+    {
+      "type": "Microsoft.Authorization/roleAssignments",
+      "apiVersion": "2022-04-01",
+      "scope": "[resourceId('Microsoft.KeyVault/vaults', format('kv-{0}', variables('prefix')))]",
+      "name": "[guid(resourceId('Microsoft.KeyVault/vaults', format('kv-{0}', variables('prefix'))), resourceId('Microsoft.Web/sites', format('func-{0}', variables('prefix'))), 'kv-secrets-user')]",
+      "properties": {
+        "roleDefinitionId": "[subscriptionResourceId('Microsoft.Authorization/roleDefinitions', '4633458b-17de-408a-b874-0445c86b69e6')]",
+        "principalId": "[reference(resourceId('Microsoft.Web/sites', format('func-{0}', variables('prefix'))), '2023-01-01', 'full').identity.principalId]",
+        "principalType": "ServicePrincipal"
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.Web/sites', format('func-{0}', variables('prefix')))]",
+        "[resourceId('Microsoft.KeyVault/vaults', format('kv-{0}', variables('prefix')))]"
+      ]
+    },
+    {
+      "type": "Microsoft.Authorization/roleAssignments",
+      "apiVersion": "2022-04-01",
+      "scope": "[resourceId('Microsoft.Storage/storageAccounts', format('st{0}{1}{2}', variables('appName'), parameters('environment'), parameters('uniqueSuffix')))]",
+      "name": "[guid(resourceId('Microsoft.Storage/storageAccounts', format('st{0}{1}{2}', variables('appName'), parameters('environment'), parameters('uniqueSuffix'))), resourceId('Microsoft.Web/sites', format('func-{0}', variables('prefix'))), 'storage-blob-owner')]",
+      "properties": {
+        "roleDefinitionId": "[subscriptionResourceId('Microsoft.Authorization/roleDefinitions', 'b7e6dc6d-f1e8-4753-8033-0f276bb0955b')]",
+        "principalId": "[reference(resourceId('Microsoft.Web/sites', format('func-{0}', variables('prefix'))), '2023-01-01', 'full').identity.principalId]",
+        "principalType": "ServicePrincipal"
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.Web/sites', format('func-{0}', variables('prefix')))]",
+        "[resourceId('Microsoft.Storage/storageAccounts', format('st{0}{1}{2}', variables('appName'), parameters('environment'), parameters('uniqueSuffix')))]"
+      ]
+    },
+    {
+      "type": "Microsoft.Authorization/roleAssignments",
+      "apiVersion": "2022-04-01",
+      "scope": "[resourceId('Microsoft.Storage/storageAccounts', format('st{0}{1}{2}', variables('appName'), parameters('environment'), parameters('uniqueSuffix')))]",
+      "name": "[guid(resourceId('Microsoft.Storage/storageAccounts', format('st{0}{1}{2}', variables('appName'), parameters('environment'), parameters('uniqueSuffix'))), resourceId('Microsoft.Web/sites', format('func-{0}', variables('prefix'))), 'storage-queue-contributor')]",
+      "properties": {
+        "roleDefinitionId": "[subscriptionResourceId('Microsoft.Authorization/roleDefinitions', '974c5e8b-45b9-4653-ba55-5f855dd0fb88')]",
+        "principalId": "[reference(resourceId('Microsoft.Web/sites', format('func-{0}', variables('prefix'))), '2023-01-01', 'full').identity.principalId]",
+        "principalType": "ServicePrincipal"
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.Web/sites', format('func-{0}', variables('prefix')))]",
+        "[resourceId('Microsoft.Storage/storageAccounts', format('st{0}{1}{2}', variables('appName'), parameters('environment'), parameters('uniqueSuffix')))]"
+      ]
+    },
+    {
+      "type": "Microsoft.Authorization/roleAssignments",
+      "apiVersion": "2022-04-01",
+      "scope": "[resourceId('Microsoft.Storage/storageAccounts', format('st{0}{1}{2}', variables('appName'), parameters('environment'), parameters('uniqueSuffix')))]",
+      "name": "[guid(resourceId('Microsoft.Storage/storageAccounts', format('st{0}{1}{2}', variables('appName'), parameters('environment'), parameters('uniqueSuffix'))), resourceId('Microsoft.Web/sites', format('func-{0}', variables('prefix'))), 'storage-table-contributor')]",
+      "properties": {
+        "roleDefinitionId": "[subscriptionResourceId('Microsoft.Authorization/roleDefinitions', '0a9a7e1f-b9d0-4cc4-a60d-0319b160aaa3')]",
+        "principalId": "[reference(resourceId('Microsoft.Web/sites', format('func-{0}', variables('prefix'))), '2023-01-01', 'full').identity.principalId]",
+        "principalType": "ServicePrincipal"
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.Web/sites', format('func-{0}', variables('prefix')))]",
+        "[resourceId('Microsoft.Storage/storageAccounts', format('st{0}{1}{2}', variables('appName'), parameters('environment'), parameters('uniqueSuffix')))]"
+      ]
+    },
+    {
+      "type": "Microsoft.Web/sites/config",
+      "apiVersion": "2023-01-01",
+      "name": "[format('{0}/{1}', format('func-{0}', variables('prefix')), 'appsettings')]",
+      "properties": {
+        "AzureWebJobsStorage__accountName": "[format('st{0}{1}{2}', variables('appName'), parameters('environment'), parameters('uniqueSuffix'))]",
+        "WEBSITE_CONTENTAZUREFILECONNECTIONSTRING": "[format('@Microsoft.KeyVault(VaultName={0};SecretName=storage-content-connection)', format('kv-{0}', variables('prefix')))]",
+        "WEBSITE_CONTENTSHARE": "[format('func-{0}', variables('prefix'))]",
+        "FUNCTIONS_EXTENSION_VERSION": "~4",
+        "FUNCTIONS_WORKER_RUNTIME": "node",
+        "APPLICATIONINSIGHTS_CONNECTION_STRING": "[reference(resourceId('Microsoft.Insights/components', format('ai-{0}', variables('prefix'))), '2020-02-02').ConnectionString]",
+        "AZURE_TENANT_ID": "[parameters('tenantId')]",
+        "AZURE_SUBSCRIPTION_ID": "[parameters('monitoredSubscriptionId')]",
+        "AZURE_CLIENT_ID": "[format('@Microsoft.KeyVault(VaultName={0};SecretName=sp-client-id)', format('kv-{0}', variables('prefix')))]",
+        "AZURE_CLIENT_SECRET": "[format('@Microsoft.KeyVault(VaultName={0};SecretName=sp-client-secret)', format('kv-{0}', variables('prefix')))]",
+        "ANTHROPIC_API_KEY": "[format('@Microsoft.KeyVault(VaultName={0};SecretName=anthropic-api-key)', format('kv-{0}', variables('prefix')))]",
+        "ENVIRONMENT": "[parameters('environment')]",
+        "NODE_ENV": "[if(equals(parameters('environment'), 'prod'), 'production', 'development')]"
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.Insights/components', format('ai-{0}', variables('prefix')))]",
+        "[resourceId('Microsoft.Web/sites', format('func-{0}', variables('prefix')))]",
+        "[resourceId('Microsoft.KeyVault/vaults', format('kv-{0}', variables('prefix')))]",
+        "[extensionResourceId(resourceId('Microsoft.KeyVault/vaults', format('kv-{0}', variables('prefix'))), 'Microsoft.Authorization/roleAssignments', guid(resourceId('Microsoft.KeyVault/vaults', format('kv-{0}', variables('prefix'))), resourceId('Microsoft.Web/sites', format('func-{0}', variables('prefix'))), 'kv-secrets-user'))]",
+        "[resourceId('Microsoft.KeyVault/vaults/secrets', format('kv-{0}', variables('prefix')), 'anthropic-api-key')]",
+        "[resourceId('Microsoft.KeyVault/vaults/secrets', format('kv-{0}', variables('prefix')), 'sp-client-id')]",
+        "[resourceId('Microsoft.KeyVault/vaults/secrets', format('kv-{0}', variables('prefix')), 'sp-client-secret')]",
+        "[resourceId('Microsoft.KeyVault/vaults/secrets', format('kv-{0}', variables('prefix')), 'storage-content-connection')]",
+        "[resourceId('Microsoft.Storage/storageAccounts', format('st{0}{1}{2}', variables('appName'), parameters('environment'), parameters('uniqueSuffix')))]",
+        "[extensionResourceId(resourceId('Microsoft.Storage/storageAccounts', format('st{0}{1}{2}', variables('appName'), parameters('environment'), parameters('uniqueSuffix'))), 'Microsoft.Authorization/roleAssignments', guid(resourceId('Microsoft.Storage/storageAccounts', format('st{0}{1}{2}', variables('appName'), parameters('environment'), parameters('uniqueSuffix'))), resourceId('Microsoft.Web/sites', format('func-{0}', variables('prefix'))), 'storage-blob-owner'))]",
+        "[extensionResourceId(resourceId('Microsoft.Storage/storageAccounts', format('st{0}{1}{2}', variables('appName'), parameters('environment'), parameters('uniqueSuffix'))), 'Microsoft.Authorization/roleAssignments', guid(resourceId('Microsoft.Storage/storageAccounts', format('st{0}{1}{2}', variables('appName'), parameters('environment'), parameters('uniqueSuffix'))), resourceId('Microsoft.Web/sites', format('func-{0}', variables('prefix'))), 'storage-queue-contributor'))]",
+        "[extensionResourceId(resourceId('Microsoft.Storage/storageAccounts', format('st{0}{1}{2}', variables('appName'), parameters('environment'), parameters('uniqueSuffix'))), 'Microsoft.Authorization/roleAssignments', guid(resourceId('Microsoft.Storage/storageAccounts', format('st{0}{1}{2}', variables('appName'), parameters('environment'), parameters('uniqueSuffix'))), resourceId('Microsoft.Web/sites', format('func-{0}', variables('prefix'))), 'storage-table-contributor'))]"
+      ]
+    },
+    {
+      "type": "Microsoft.Web/staticSites",
+      "apiVersion": "2023-01-01",
+      "name": "[format('swa-{0}', variables('prefix'))]",
+      "location": "[parameters('location')]",
+      "tags": "[variables('tags')]",
+      "sku": {
+        "name": "Free",
+        "tier": "Free"
+      },
+      "properties": {
+        "stagingEnvironmentPolicy": "Enabled",
+        "allowConfigFileUpdates": true,
+        "buildProperties": {
+          "appLocation": "/",
+          "apiLocation": "",
+          "outputLocation": "build"
+        }
+      }
+    },
+    {
+      "type": "Microsoft.Insights/actionGroups",
+      "apiVersion": "2023-01-01",
+      "name": "[format('ag-{0}', variables('prefix'))]",
+      "location": "global",
+      "tags": "[variables('tags')]",
+      "properties": {
+        "groupShortName": "VMHealth",
+        "enabled": true,
+        "emailReceivers": "[variables('emailReceivers')]",
+        "webhookReceivers": "[variables('webhookReceivers')]"
+      }
+    },
+    {
+      "type": "Microsoft.Insights/metricAlerts",
+      "apiVersion": "2018-03-01",
+      "name": "[format('alert-high-cpu-{0}', variables('prefix'))]",
+      "location": "global",
+      "tags": "[variables('tags')]",
+      "properties": {
+        "description": "Fires when any VM CPU exceeds 85% for 5 minutes",
+        "severity": 2,
+        "enabled": true,
+        "scopes": [
+          "[format('/subscriptions/{0}', parameters('monitoredSubscriptionId'))]"
+        ],
+        "evaluationFrequency": "PT1M",
+        "windowSize": "PT5M",
+        "targetResourceType": "Microsoft.Compute/virtualMachines",
+        "targetResourceRegion": "[parameters('location')]",
+        "criteria": {
+          "odata.type": "Microsoft.Azure.Monitor.MultipleResourceMultipleMetricCriteria",
+          "allOf": [
+            {
+              "name": "HighCPU",
+              "criterionType": "StaticThresholdCriterion",
+              "metricName": "Percentage CPU",
+              "metricNamespace": "Microsoft.Compute/virtualMachines",
+              "operator": "GreaterThan",
+              "threshold": 85,
+              "timeAggregation": "Average"
+            }
+          ]
+        },
+        "actions": [
+          {
+            "actionGroupId": "[resourceId('Microsoft.Insights/actionGroups', format('ag-{0}', variables('prefix')))]",
+            "webHookProperties": {}
+          }
+        ]
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.Insights/actionGroups', format('ag-{0}', variables('prefix')))]"
+      ]
+    },
+    {
+      "type": "Microsoft.Insights/metricAlerts",
+      "apiVersion": "2018-03-01",
+      "name": "[format('alert-high-disk-{0}', variables('prefix'))]",
+      "location": "global",
+      "tags": "[variables('tags')]",
+      "properties": {
+        "description": "Fires when VM OS disk queue depth is critically high (>50)",
+        "severity": 2,
+        "enabled": true,
+        "scopes": [
+          "[format('/subscriptions/{0}', parameters('monitoredSubscriptionId'))]"
+        ],
+        "evaluationFrequency": "PT5M",
+        "windowSize": "PT15M",
+        "targetResourceType": "Microsoft.Compute/virtualMachines",
+        "targetResourceRegion": "[parameters('location')]",
+        "criteria": {
+          "odata.type": "Microsoft.Azure.Monitor.MultipleResourceMultipleMetricCriteria",
+          "allOf": [
+            {
+              "name": "HighDiskQueue",
+              "criterionType": "StaticThresholdCriterion",
+              "metricName": "OS Disk Queue Depth",
+              "metricNamespace": "Microsoft.Compute/virtualMachines",
+              "operator": "GreaterThan",
+              "threshold": 50,
+              "timeAggregation": "Average"
+            }
+          ]
+        },
+        "actions": [
+          {
+            "actionGroupId": "[resourceId('Microsoft.Insights/actionGroups', format('ag-{0}', variables('prefix')))]",
+            "webHookProperties": {}
+          }
+        ]
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.Insights/actionGroups', format('ag-{0}', variables('prefix')))]"
+      ]
+    },
+    {
+      "type": "Microsoft.Insights/metricAlerts",
+      "apiVersion": "2018-03-01",
+      "name": "[format('alert-low-memory-{0}', variables('prefix'))]",
+      "location": "global",
+      "tags": "[variables('tags')]",
+      "properties": {
+        "description": "Fires when VM available memory drops below 1 GB",
+        "severity": 1,
+        "enabled": true,
+        "scopes": [
+          "[format('/subscriptions/{0}', parameters('monitoredSubscriptionId'))]"
+        ],
+        "evaluationFrequency": "PT1M",
+        "windowSize": "PT5M",
+        "targetResourceType": "Microsoft.Compute/virtualMachines",
+        "targetResourceRegion": "[parameters('location')]",
+        "criteria": {
+          "odata.type": "Microsoft.Azure.Monitor.MultipleResourceMultipleMetricCriteria",
+          "allOf": [
+            {
+              "name": "LowAvailableMemory",
+              "criterionType": "StaticThresholdCriterion",
+              "metricName": "Available Memory Bytes",
+              "metricNamespace": "Microsoft.Compute/virtualMachines",
+              "operator": "LessThan",
+              "threshold": 1073741824,
+              "timeAggregation": "Average"
+            }
+          ]
+        },
+        "actions": [
+          {
+            "actionGroupId": "[resourceId('Microsoft.Insights/actionGroups', format('ag-{0}', variables('prefix')))]",
+            "webHookProperties": {}
+          }
+        ]
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.Insights/actionGroups', format('ag-{0}', variables('prefix')))]"
+      ]
+    }
+  ],
+  "outputs": {
+    "functionAppUrl": {
+      "type": "string",
+      "value": "[format('https://{0}', reference(resourceId('Microsoft.Web/sites', format('func-{0}', variables('prefix'))), '2023-01-01').defaultHostName)]"
+    },
+    "functionAppName": {
+      "type": "string",
+      "value": "[format('func-{0}', variables('prefix'))]"
+    },
+    "staticWebAppUrl": {
+      "type": "string",
+      "value": "[format('https://{0}', reference(resourceId('Microsoft.Web/staticSites', format('swa-{0}', variables('prefix'))), '2023-01-01').defaultHostname)]"
+    },
+    "staticWebAppName": {
+      "type": "string",
+      "value": "[format('swa-{0}', variables('prefix'))]"
+    },
+    "staticWebAppHostname": {
+      "type": "string",
+      "value": "[reference(resourceId('Microsoft.Web/staticSites', format('swa-{0}', variables('prefix'))), '2023-01-01').defaultHostname]"
+    },
+    "keyVaultName": {
+      "type": "string",
+      "value": "[format('kv-{0}', variables('prefix'))]"
+    },
+    "keyVaultUri": {
+      "type": "string",
+      "value": "[reference(resourceId('Microsoft.KeyVault/vaults', format('kv-{0}', variables('prefix'))), '2023-02-01').vaultUri]"
+    },
+    "appInsightsName": {
+      "type": "string",
+      "value": "[format('ai-{0}', variables('prefix'))]"
+    },
+    "appInsightsConnectionString": {
+      "type": "string",
+      "value": "[reference(resourceId('Microsoft.Insights/components', format('ai-{0}', variables('prefix'))), '2020-02-02').ConnectionString]"
+    },
+    "logAnalyticsWorkspaceId": {
+      "type": "string",
+      "value": "[resourceId('Microsoft.OperationalInsights/workspaces', format('law-{0}', variables('prefix')))]"
+    },
+    "functionAppPrincipalId": {
+      "type": "string",
+      "value": "[reference(resourceId('Microsoft.Web/sites', format('func-{0}', variables('prefix'))), '2023-01-01', 'full').identity.principalId]"
+    },
+    "storageAccountName": {
+      "type": "string",
+      "value": "[format('st{0}{1}{2}', variables('appName'), parameters('environment'), parameters('uniqueSuffix'))]"
+    },
+    "deploymentNotes": {
+      "type": "string",
+      "value": "DEPLOYMENT COMPLETE - POST-DEPLOYMENT STEPS:\n\n1. WAIT FOR RBAC PROPAGATION (5-15 minutes):\n   - RBAC role assignments may take time to propagate\n   - If Function App shows Key Vault errors on startup, wait and restart:\n     az functionapp restart --name ${functionApp.name} --resource-group ${resourceGroup().name}\n\n2. UPDATE CORS FOR PRODUCTION (if using wildcard):\n   - If staticWebAppHostnameForCors was left empty, run:\n     az functionapp cors add --name ${functionApp.name} --allowed-origins https://${staticWebApp.properties.defaultHostname} --resource-group ${resourceGroup().name}\n\n3. CONFIGURE STATIC WEB APP BUILD:\n   - Go to Azure Portal > Static Web Apps > ${staticWebApp.name}\n   - Configure build settings for your React app deployment\n\n4. UPDATE ALERT NOTIFICATIONS:\n   - Add email receivers: az monitor action-group update --name ag-${prefix} --add-receiver <email>\n   - Or update webhook: az monitor action-group webhook-receiver create --name ag-${prefix} --webhook-service-uri <url>\n\n5. VERIFY FUNCTION APP:\n   - Test Key Vault access:\n     az functionapp config appsettings list --name ${functionApp.name} --resource-group ${resourceGroup().name}\n   - Deploy function code and test\n\nFor more details, see BICEP_VALIDATION_REPORT.md\n"
+    }
+  }
+}

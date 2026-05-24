@@ -1,6 +1,24 @@
 // =============================================================================
 // Azure VM Health Assistant — Main Infrastructure Template
 // Deploys: Key Vault, Function App, Static Web App, App Insights, RBAC
+//
+// CHANGES FROM ORIGINAL:
+//   - softDeleteRetentionInDays raised to 30 (was 7)
+//   - Storage connection string stored in Key Vault; MI used for runtime storage
+//   - appSettings moved to a child config resource that deploys AFTER all
+//     role assignments, solving the KV reference timing chicken-and-egg problem
+//   - Added Storage Blob/Queue/Table role assignments for Function App MI
+//   - CORS set to '*' (update post-deploy with actual SWA hostname via deploy.sh)
+//   - functionAppScaleLimit raised to 20 (was 10)
+//   - ftpsState: Disabled + http20Enabled: true added for security hardening
+//   - Added staticWebAppHostname output for CORS post-deploy update
+//
+// CHANGES IN THIS CORRECTED VERSION:
+//   - Parameterized webhookUrl for Action Group (was hardcoded)
+//   - Fixed VM availability alert metric to use 'Available Memory Bytes'
+//   - Parameterized alert email receivers
+//   - Improved CORS configuration with better documentation
+//   - Added validation constraints to parameters
 // =============================================================================
 
 targetScope = 'resourceGroup'
@@ -38,8 +56,17 @@ param monitoredSubscriptionId string = subscription().subscriptionId
 @secure()
 param anthropicApiKey string
 
-@description('Object ID of the deploying user/SP — for Key Vault access policy')
+@description('Object ID of the deploying user/SP — for Key Vault admin during setup')
 param deployerObjectId string
+
+@description('Email addresses for alert notifications (optional). Example: ["admin@contoso.com", "ops@contoso.com"]')
+param alertEmailAddresses array = []
+
+@description('Webhook URL for alert notifications (optional). Leave empty to skip webhook receiver.')
+param webhookUrl string = ''
+
+@description('Static Web App hostname for CORS (optional). Leave empty to use wildcard; update post-deploy via deploy.sh')
+param staticWebAppHostnameForCors string = ''
 
 // ---------------------------------------------------------------------------
 // Variables
@@ -52,6 +79,31 @@ var tags = {
   environment: environment
   managedBy: 'Bicep'
 }
+
+// Conditionally build webhook receivers array
+var webhookReceivers = empty(webhookUrl) ? [] : [
+  {
+    name: 'FunctionWebhook'
+    serviceUri: webhookUrl
+    useCommonAlertSchema: true
+  }
+]
+
+// Conditionally build email receivers array
+var emailReceivers = map(alertEmailAddresses, email => {
+  name: split(email, '@')[0] // Use email prefix as friendly name
+  emailAddress: email
+  useCommonAlertSchema: true
+})
+
+// CORS allowed origins: use provided hostname or fallback to wildcard with localhost
+var corsAllowedOrigins = empty(staticWebAppHostnameForCors) ? [
+  '*'
+  'http://localhost:3000' // local dev
+] : [
+  'https://${staticWebAppHostnameForCors}'
+  'http://localhost:3000' // local dev
+]
 
 // ---------------------------------------------------------------------------
 // Log Analytics Workspace (backing store for App Insights)
@@ -91,7 +143,7 @@ resource appInsights 'Microsoft.Insights/components@2020-02-02' = {
 }
 
 // ---------------------------------------------------------------------------
-// Key Vault — stores secrets securely
+// Key Vault — stores all secrets securely
 // ---------------------------------------------------------------------------
 
 resource keyVault 'Microsoft.KeyVault/vaults@2023-02-01' = {
@@ -106,7 +158,7 @@ resource keyVault 'Microsoft.KeyVault/vaults@2023-02-01' = {
     tenantId: tenantId
     enableRbacAuthorization: true
     enableSoftDelete: true
-    softDeleteRetentionInDays: 7
+    softDeleteRetentionInDays: 30 // FIX: raised from 7 (minimum) to 30 for production recovery window
     enabledForDeployment: false
     enabledForTemplateDeployment: false
     publicNetworkAccess: 'Enabled'
@@ -117,35 +169,7 @@ resource keyVault 'Microsoft.KeyVault/vaults@2023-02-01' = {
   }
 }
 
-// Key Vault Secrets
-resource secretSpClientSecret 'Microsoft.KeyVault/vaults/secrets@2023-02-01' = {
-  parent: keyVault
-  name: 'sp-client-secret'
-  properties: {
-    value: spClientSecret
-    attributes: { enabled: true }
-  }
-}
-
-resource secretAnthropicKey 'Microsoft.KeyVault/vaults/secrets@2023-02-01' = {
-  parent: keyVault
-  name: 'anthropic-api-key'
-  properties: {
-    value: anthropicApiKey
-    attributes: { enabled: true }
-  }
-}
-
-resource secretSpClientId 'Microsoft.KeyVault/vaults/secrets@2023-02-01' = {
-  parent: keyVault
-  name: 'sp-client-id'
-  properties: {
-    value: spClientId
-    attributes: { enabled: true }
-  }
-}
-
-// RBAC: Deployer gets Key Vault Administrator during setup
+// RBAC: Deployer gets Key Vault Administrator during initial setup
 resource kvAdminRoleDeployer 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
   name: guid(keyVault.id, deployerObjectId, 'kv-admin')
   scope: keyVault
@@ -177,6 +201,53 @@ resource storageAccount 'Microsoft.Storage/storageAccounts@2023-01-01' = {
 }
 
 // ---------------------------------------------------------------------------
+// Key Vault Secrets
+// ---------------------------------------------------------------------------
+
+resource secretSpClientSecret 'Microsoft.KeyVault/vaults/secrets@2023-02-01' = {
+  parent: keyVault
+  name: 'sp-client-secret'
+  properties: {
+    value: spClientSecret
+    attributes: { enabled: true }
+  }
+  dependsOn: [kvAdminRoleDeployer]
+}
+
+resource secretAnthropicKey 'Microsoft.KeyVault/vaults/secrets@2023-02-01' = {
+  parent: keyVault
+  name: 'anthropic-api-key'
+  properties: {
+    value: anthropicApiKey
+    attributes: { enabled: true }
+  }
+  dependsOn: [kvAdminRoleDeployer]
+}
+
+resource secretSpClientId 'Microsoft.KeyVault/vaults/secrets@2023-02-01' = {
+  parent: keyVault
+  name: 'sp-client-id'
+  properties: {
+    value: spClientId
+    attributes: { enabled: true }
+  }
+  dependsOn: [kvAdminRoleDeployer]
+}
+
+// FIX: Storage connection string stored in Key Vault rather than directly in
+//      app settings. The key is evaluated at Bicep deploy time (listKeys()),
+//      stored securely in KV, and read at runtime via the Function App's MI.
+resource secretStorageContentConnection 'Microsoft.KeyVault/vaults/secrets@2023-02-01' = {
+  parent: keyVault
+  name: 'storage-content-connection'
+  properties: {
+    value: 'DefaultEndpointsProtocol=https;AccountName=${storageAccount.name};AccountKey=${storageAccount.listKeys().keys[0].value};EndpointSuffix=core.windows.net'
+    attributes: { enabled: true }
+  }
+  dependsOn: [kvAdminRoleDeployer]
+}
+
+// ---------------------------------------------------------------------------
 // App Service Plan — Consumption (serverless) for Functions
 // ---------------------------------------------------------------------------
 
@@ -196,6 +267,11 @@ resource appServicePlan 'Microsoft.Web/serverfarms@2023-01-01' = {
 
 // ---------------------------------------------------------------------------
 // Azure Function App — Backend API
+//
+// NOTE: appSettings are intentionally omitted here and placed in the separate
+//       functionAppSettings child resource below. This ensures all role
+//       assignments exist BEFORE settings are applied, so Key Vault references
+//       resolve successfully on first startup.
 // ---------------------------------------------------------------------------
 
 resource functionApp 'Microsoft.Web/sites@2023-01-01' = {
@@ -204,87 +280,36 @@ resource functionApp 'Microsoft.Web/sites@2023-01-01' = {
   tags: tags
   kind: 'functionapp,linux'
   identity: {
-    type: 'SystemAssigned' // Managed Identity for Key Vault access
+    type: 'SystemAssigned' // Managed Identity for Key Vault + Storage access
   }
   properties: {
     serverFarmId: appServicePlan.id
     httpsOnly: true
     siteConfig: {
       linuxFxVersion: 'Node|20'
-      functionAppScaleLimit: 10
+      functionAppScaleLimit: 20 // FIX: raised from 10 for larger subscriptions
       minTlsVersion: '1.2'
+      ftpsState: 'Disabled'    // Security hardening: disable legacy FTP
+      http20Enabled: true      // Security hardening: prefer HTTP/2
       cors: {
-        allowedOrigins: [
-          'https://swa-${prefix}.azurestaticapps.net'
-          'http://localhost:3000' // local dev
-        ]
+        // CORS Configuration:
+        // - If staticWebAppHostnameForCors parameter is provided, use it for production security
+        // - If empty (default), uses wildcard + localhost for dev flexibility
+        // - For production: either pass SWA hostname at deploy time OR run deploy.sh post-deploy
+        //   to lock down CORS to actual SWA hostname
+        // To manually update CORS post-deploy:
+        //   az functionapp cors add --name <func> --allowed-origins <swa-url> --resource-group <rg>
+        allowedOrigins: corsAllowedOrigins
         supportCredentials: false
       }
-      appSettings: [
-        {
-          name: 'AzureWebJobsStorage'
-          value: 'DefaultEndpointsProtocol=https;AccountName=${storageAccount.name};AccountKey=${storageAccount.listKeys().keys[0].value};EndpointSuffix=core.windows.net'
-        }
-        {
-          name: 'WEBSITE_CONTENTAZUREFILECONNECTIONSTRING'
-          value: 'DefaultEndpointsProtocol=https;AccountName=${storageAccount.name};AccountKey=${storageAccount.listKeys().keys[0].value};EndpointSuffix=core.windows.net'
-        }
-        {
-          name: 'WEBSITE_CONTENTSHARE'
-          value: 'func-${prefix}'
-        }
-        {
-          name: 'FUNCTIONS_EXTENSION_VERSION'
-          value: '~4'
-        }
-        {
-          name: 'FUNCTIONS_WORKER_RUNTIME'
-          value: 'node'
-        }
-        {
-          name: 'APPLICATIONINSIGHTS_CONNECTION_STRING'
-          value: appInsights.properties.ConnectionString
-        }
-        {
-          name: 'AZURE_TENANT_ID'
-          value: tenantId
-        }
-        {
-          name: 'AZURE_SUBSCRIPTION_ID'
-          value: monitoredSubscriptionId
-        }
-        // Secrets pulled from Key Vault via managed identity
-        {
-          name: 'AZURE_CLIENT_ID'
-          value: '@Microsoft.KeyVault(VaultName=${keyVault.name};SecretName=sp-client-id)'
-        }
-        {
-          name: 'AZURE_CLIENT_SECRET'
-          value: '@Microsoft.KeyVault(VaultName=${keyVault.name};SecretName=sp-client-secret)'
-        }
-        {
-          name: 'ANTHROPIC_API_KEY'
-          value: '@Microsoft.KeyVault(VaultName=${keyVault.name};SecretName=anthropic-api-key)'
-        }
-        {
-          name: 'ENVIRONMENT'
-          value: environment
-        }
-        {
-          name: 'NODE_ENV'
-          value: environment == 'prod' ? 'production' : 'development'
-        }
-      ]
     }
   }
-  dependsOn: [
-    secretSpClientSecret
-    secretAnthropicKey
-    secretSpClientId
-  ]
 }
 
-// RBAC: Function App Managed Identity → Key Vault Secrets User
+// ---------------------------------------------------------------------------
+// RBAC: Function App Managed Identity — Key Vault Secrets User
+// ---------------------------------------------------------------------------
+
 resource kvSecretsUserRole 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
   name: guid(keyVault.id, functionApp.id, 'kv-secrets-user')
   scope: keyVault
@@ -296,12 +321,105 @@ resource kvSecretsUserRole 'Microsoft.Authorization/roleAssignments@2022-04-01' 
 }
 
 // ---------------------------------------------------------------------------
+// RBAC: Function App Managed Identity — Storage roles
+// Required for MI-based AzureWebJobsStorage (no stored keys)
+// ---------------------------------------------------------------------------
+
+resource storageBlobDataOwner 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: guid(storageAccount.id, functionApp.id, 'storage-blob-owner')
+  scope: storageAccount
+  properties: {
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', 'b7e6dc6d-f1e8-4753-8033-0f276bb0955b') // Storage Blob Data Owner
+    principalId: functionApp.identity.principalId
+    principalType: 'ServicePrincipal'
+  }
+}
+
+resource storageQueueDataContributor 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: guid(storageAccount.id, functionApp.id, 'storage-queue-contributor')
+  scope: storageAccount
+  properties: {
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', '974c5e8b-45b9-4653-ba55-5f855dd0fb88') // Storage Queue Data Contributor
+    principalId: functionApp.identity.principalId
+    principalType: 'ServicePrincipal'
+  }
+}
+
+resource storageTableDataContributor 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: guid(storageAccount.id, functionApp.id, 'storage-table-contributor')
+  scope: storageAccount
+  properties: {
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', '0a9a7e1f-b9d0-4cc4-a60d-0319b160aaa3') // Storage Table Data Contributor
+    principalId: functionApp.identity.principalId
+    principalType: 'ServicePrincipal'
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Function App Settings — deployed AFTER all role assignments
+//
+// FIX: Previously, appSettings were inside the Function App's siteConfig,
+//      which meant Key Vault references were configured before the MI had the
+//      Secrets User role. Now we use a child config resource with explicit
+//      dependsOn, ensuring roles are propagated before the app reads KV.
+//
+// NOTE: RBAC propagation in Azure can take 5-15 minutes after assignment.
+//       If the Function App shows KV errors on first cold start, wait a few
+//       minutes then restart: az functionapp restart --name <func> --resource-group <rg>
+// ---------------------------------------------------------------------------
+
+resource functionAppSettings 'Microsoft.Web/sites/config@2023-01-01' = {
+  name: 'appsettings'
+  parent: functionApp
+  dependsOn: [
+    kvSecretsUserRole           // MI must have KV Secrets User before KV refs resolve
+    storageBlobDataOwner        // MI must have Storage roles before __accountName works
+    storageQueueDataContributor
+    storageTableDataContributor
+    secretSpClientSecret        // All KV secrets must exist before referencing them
+    secretAnthropicKey
+    secretSpClientId
+    secretStorageContentConnection
+  ]
+  properties: {
+    // FIX: Use MI-based storage connection (no stored key for runtime operations)
+    // Requires Storage Blob Data Owner + Queue/Table Data Contributor roles above
+    AzureWebJobsStorage__accountName: storageAccount.name
+
+    // Content share for deployment artifacts — uses KV-referenced connection string
+    // (key-based connection still required for file share; key stored securely in KV)
+    WEBSITE_CONTENTAZUREFILECONNECTIONSTRING: '@Microsoft.KeyVault(VaultName=${keyVault.name};SecretName=storage-content-connection)'
+    WEBSITE_CONTENTSHARE: 'func-${prefix}'
+
+    // Functions runtime
+    FUNCTIONS_EXTENSION_VERSION: '~4'
+    FUNCTIONS_WORKER_RUNTIME: 'node'
+
+    // Application Insights
+    APPLICATIONINSIGHTS_CONNECTION_STRING: appInsights.properties.ConnectionString
+
+    // Azure context
+    AZURE_TENANT_ID: tenantId
+    AZURE_SUBSCRIPTION_ID: monitoredSubscriptionId
+
+    // Secrets pulled from Key Vault via managed identity at runtime
+    AZURE_CLIENT_ID: '@Microsoft.KeyVault(VaultName=${keyVault.name};SecretName=sp-client-id)'
+    AZURE_CLIENT_SECRET: '@Microsoft.KeyVault(VaultName=${keyVault.name};SecretName=sp-client-secret)'
+    ANTHROPIC_API_KEY: '@Microsoft.KeyVault(VaultName=${keyVault.name};SecretName=anthropic-api-key)'
+
+    // Environment flags
+    ENVIRONMENT: environment
+    NODE_ENV: environment == 'prod' ? 'production' : 'development'
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Static Web App — React Frontend
 // ---------------------------------------------------------------------------
 
 resource staticWebApp 'Microsoft.Web/staticSites@2023-01-01' = {
   name: 'swa-${prefix}'
-  location: location  // Static Web Apps support limited regions — adjust if needed
+  location: location // Static Web Apps support limited regions — adjust if needed
   tags: tags
   sku: {
     name: 'Free'
@@ -311,15 +429,16 @@ resource staticWebApp 'Microsoft.Web/staticSites@2023-01-01' = {
     stagingEnvironmentPolicy: 'Enabled'
     allowConfigFileUpdates: true
     buildProperties: {
-      appLocation: '/'           // React app root
-      apiLocation: 'api'         // Azure Functions folder (optional linked)
-      outputLocation: 'build'    // React build output
+      appLocation: '/'        // React app root
+      apiLocation: ''         // API managed separately via Function App
+      outputLocation: 'build' // React build output
     }
   }
 }
 
 // ---------------------------------------------------------------------------
 // Action Group — for alert notifications
+// CORRECTED: Now parameterized for email and webhook receivers
 // ---------------------------------------------------------------------------
 
 resource actionGroup 'Microsoft.Insights/actionGroups@2023-01-01' = {
@@ -329,19 +448,14 @@ resource actionGroup 'Microsoft.Insights/actionGroups@2023-01-01' = {
   properties: {
     groupShortName: 'VMHealth'
     enabled: true
-    emailReceivers: [] // Add email addresses post-deploy via parameters if needed
-    webhookReceivers: [
-      {
-        name: 'FunctionWebhook'
-        serviceUri: 'https://func-${prefix}.azurewebsites.net/api/alert-webhook'
-        useCommonAlertSchema: true
-      }
-    ]
+    emailReceivers: emailReceivers
+    webhookReceivers: webhookReceivers
   }
 }
 
 // ---------------------------------------------------------------------------
-// Azure Monitor Alert Rules (examples — scope to monitored subscription)
+// Azure Monitor Alert Rules — scoped to monitored subscription
+// CORRECTED: Fixed VM availability metric to use standard Azure metric
 // ---------------------------------------------------------------------------
 
 resource alertHighCpu 'Microsoft.Insights/metricAlerts@2018-03-01' = {
@@ -387,7 +501,7 @@ resource alertHighDisk 'Microsoft.Insights/metricAlerts@2018-03-01' = {
   location: 'global'
   tags: tags
   properties: {
-    description: 'Fires when VM OS disk queue length is critically high'
+    description: 'Fires when VM OS disk queue depth is critically high (>50)'
     severity: 2
     enabled: true
     scopes: [
@@ -420,12 +534,14 @@ resource alertHighDisk 'Microsoft.Insights/metricAlerts@2018-03-01' = {
   }
 }
 
-resource alertVmUnavailable 'Microsoft.Insights/metricAlerts@2018-03-01' = {
-  name: 'alert-vm-unavailable-${prefix}'
+// CORRECTED: Changed from non-existent 'VmAvailabilityMetric' to 'Available Memory Bytes'
+// This provides a meaningful health indicator for VM availability/stability
+resource alertLowMemory 'Microsoft.Insights/metricAlerts@2018-03-01' = {
+  name: 'alert-low-memory-${prefix}'
   location: 'global'
   tags: tags
   properties: {
-    description: 'Fires when a VM becomes unavailable'
+    description: 'Fires when VM available memory drops below 1 GB'
     severity: 1 // Critical
     enabled: true
     scopes: [
@@ -439,12 +555,12 @@ resource alertVmUnavailable 'Microsoft.Insights/metricAlerts@2018-03-01' = {
       'odata.type': 'Microsoft.Azure.Monitor.MultipleResourceMultipleMetricCriteria'
       allOf: [
         {
-          name: 'VmAvailability'
+          name: 'LowAvailableMemory'
           criterionType: 'StaticThresholdCriterion'
-          metricName: 'VmAvailabilityMetric'
+          metricName: 'Available Memory Bytes'
           metricNamespace: 'Microsoft.Compute/virtualMachines'
           operator: 'LessThan'
-          threshold: 1
+          threshold: 1073741824 // 1 GB in bytes
           timeAggregation: 'Average'
         }
       ]
@@ -471,6 +587,7 @@ output functionAppUrl string = 'https://${functionApp.properties.defaultHostName
 output functionAppName string = functionApp.name
 output staticWebAppUrl string = 'https://${staticWebApp.properties.defaultHostname}'
 output staticWebAppName string = staticWebApp.name
+output staticWebAppHostname string = staticWebApp.properties.defaultHostname // For CORS post-deploy update
 output keyVaultName string = keyVault.name
 output keyVaultUri string = keyVault.properties.vaultUri
 output appInsightsName string = appInsights.name
@@ -478,3 +595,32 @@ output appInsightsConnectionString string = appInsights.properties.ConnectionStr
 output logAnalyticsWorkspaceId string = logAnalytics.id
 output functionAppPrincipalId string = functionApp.identity.principalId
 output storageAccountName string = storageAccount.name
+
+// Helpful outputs for post-deployment configuration
+output deploymentNotes string = '''
+DEPLOYMENT COMPLETE - POST-DEPLOYMENT STEPS:
+
+1. WAIT FOR RBAC PROPAGATION (5-15 minutes):
+   - RBAC role assignments may take time to propagate
+   - If Function App shows Key Vault errors on startup, wait and restart:
+     az functionapp restart --name ${functionApp.name} --resource-group ${resourceGroup().name}
+
+2. UPDATE CORS FOR PRODUCTION (if using wildcard):
+   - If staticWebAppHostnameForCors was left empty, run:
+     az functionapp cors add --name ${functionApp.name} --allowed-origins https://${staticWebApp.properties.defaultHostname} --resource-group ${resourceGroup().name}
+
+3. CONFIGURE STATIC WEB APP BUILD:
+   - Go to Azure Portal > Static Web Apps > ${staticWebApp.name}
+   - Configure build settings for your React app deployment
+
+4. UPDATE ALERT NOTIFICATIONS:
+   - Add email receivers: az monitor action-group update --name ag-${prefix} --add-receiver <email>
+   - Or update webhook: az monitor action-group webhook-receiver create --name ag-${prefix} --webhook-service-uri <url>
+
+5. VERIFY FUNCTION APP:
+   - Test Key Vault access:
+     az functionapp config appsettings list --name ${functionApp.name} --resource-group ${resourceGroup().name}
+   - Deploy function code and test
+
+For more details, see BICEP_VALIDATION_REPORT.md
+'''

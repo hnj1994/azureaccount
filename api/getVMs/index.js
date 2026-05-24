@@ -7,23 +7,29 @@
 
 const { ComputeManagementClient } = require('@azure/arm-compute');
 const { MonitorClient } = require('@azure/arm-monitor');
-const { ResourceManagementClient } = require('@azure/arm-resources');
+const { AlertsManagementClient } = require('@azure/arm-alertsmanagement'); // FIX: correct alerts SDK
 const { DefaultAzureCredential, ClientSecretCredential } = require('@azure/identity');
 
 // ---------------------------------------------------------------------------
-// Auth — uses Managed Identity in production, SP credentials in dev
+// Auth — prefer Managed Identity in production; fall back to SP for local dev
+// FIX: inverted priority — MI is now preferred in Azure (NODE_ENV=production)
 // ---------------------------------------------------------------------------
 
 function getCredential() {
-  if (process.env.AZURE_CLIENT_SECRET) {
-    // Service Principal (fallback / local dev)
+  if (
+    process.env.NODE_ENV !== 'production' &&
+    process.env.AZURE_CLIENT_SECRET &&
+    process.env.AZURE_CLIENT_ID &&
+    process.env.AZURE_TENANT_ID
+  ) {
+    // Service Principal — local development only
     return new ClientSecretCredential(
       process.env.AZURE_TENANT_ID,
       process.env.AZURE_CLIENT_ID,
       process.env.AZURE_CLIENT_SECRET
     );
   }
-  // Managed Identity (preferred in Azure)
+  // Managed Identity — used in Azure (production)
   return new DefaultAzureCredential();
 }
 
@@ -46,7 +52,7 @@ async function getVMMetric(monitorClient, resourceId, metricName, timeRange = 5)
     const timeseries = result.value?.[0]?.timeseries?.[0]?.data;
     if (!timeseries || timeseries.length === 0) return null;
 
-    // Get the latest non-null value
+    // Return the most recent non-null value
     const latest = [...timeseries].reverse().find(d => d.average !== null);
     return latest?.average ?? null;
   } catch {
@@ -55,14 +61,15 @@ async function getVMMetric(monitorClient, resourceId, metricName, timeRange = 5)
 }
 
 // ---------------------------------------------------------------------------
-// Get active alerts count for a VM
+// Get active alert count for a VM
+// FIX: was using monitorClient.alerts which doesn't exist; now uses the
+//      correct AlertsManagementClient from @azure/arm-alertsmanagement
 // ---------------------------------------------------------------------------
 
-async function getAlertCount(monitorClient, subscriptionId, vmName) {
+async function getAlertCount(alertsClient, vmName) {
   try {
-    const alerts = monitorClient.alerts.getAll(`/subscriptions/${subscriptionId}`);
     let count = 0;
-    for await (const alert of alerts) {
+    for await (const alert of alertsClient.alerts.getAll()) {
       if (
         alert.essentials?.targetResourceName?.toLowerCase() === vmName.toLowerCase() &&
         alert.essentials?.monitorCondition === 'Fired'
@@ -77,14 +84,22 @@ async function getAlertCount(monitorClient, subscriptionId, vmName) {
 }
 
 // ---------------------------------------------------------------------------
-// Determine VM health status from metrics
+// Determine VM health status from live metrics
 // ---------------------------------------------------------------------------
 
-function deriveStatus(vmPowerState, cpu, memory, disk) {
-  if (!vmPowerState || vmPowerState.includes('deallocated') || vmPowerState.includes('stopped')) {
+function deriveStatus(powerState, cpu, memory, disk) {
+  if (
+    !powerState ||
+    powerState.includes('deallocated') ||
+    powerState.includes('stopped')
+  ) {
     return 'Stopped';
   }
-  if (cpu > 85 || (memory !== null && memory > 90) || (disk !== null && disk > 90)) {
+  if (
+    cpu > 85 ||
+    (memory !== null && memory > 90) ||
+    (disk !== null && disk > 90)
+  ) {
     return 'Warning';
   }
   return 'Running';
@@ -99,7 +114,10 @@ module.exports = async function (context, req) {
 
   const subscriptionId = process.env.AZURE_SUBSCRIPTION_ID;
   if (!subscriptionId) {
-    context.res = { status: 500, body: { error: 'AZURE_SUBSCRIPTION_ID not configured' } };
+    context.res = {
+      status: 500,
+      body: { error: 'AZURE_SUBSCRIPTION_ID not configured' },
+    };
     return;
   }
 
@@ -107,69 +125,111 @@ module.exports = async function (context, req) {
     const credential = getCredential();
     const computeClient = new ComputeManagementClient(credential, subscriptionId);
     const monitorClient = new MonitorClient(credential, subscriptionId);
+    // FIX: use AlertsManagementClient (separate SDK) instead of MonitorClient
+    const alertsClient = new AlertsManagementClient(credential, subscriptionId);
 
     const vmList = [];
 
-    // List all VMs in subscription
+    // List all VMs in the subscription
     for await (const vm of computeClient.virtualMachines.listAll()) {
       try {
-        // Get instance view for power state
+        // Derive resource group from ARM resource ID
         const resourceGroupName = vm.id.split('/')[4];
+
+        // Get instance view for power state
         const instanceView = await computeClient.virtualMachines.instanceView(
           resourceGroupName,
           vm.name
         );
 
-        const powerState = instanceView.statuses
-          ?.find(s => s.code?.startsWith('PowerState/'))
-          ?.code?.replace('PowerState/', '') ?? 'unknown';
+        const powerState =
+          instanceView.statuses
+            ?.find(s => s.code?.startsWith('PowerState/'))
+            ?.code?.replace('PowerState/', '') ?? 'unknown';
 
-        const isStopped = powerState === 'deallocated' || powerState === 'stopped';
+        const isStopped =
+          powerState === 'deallocated' || powerState === 'stopped';
 
-        // Fetch metrics in parallel (skip if VM is stopped)
-        let cpu = 0, memoryAvailableBytes = null, diskQueueDepth = null,
-            networkInBytes = null, networkOutBytes = null;
+        // Fetch metrics in parallel — skip if VM is stopped (no data available)
+        let cpu = 0,
+          memoryAvailableBytes = null,
+          diskQueueDepth = null,
+          networkInBytes = null,
+          networkOutBytes = null;
 
         if (!isStopped) {
-          [cpu, memoryAvailableBytes, diskQueueDepth, networkInBytes, networkOutBytes] =
-            await Promise.all([
-              getVMMetric(monitorClient, vm.id, 'Percentage CPU'),
-              getVMMetric(monitorClient, vm.id, 'Available Memory Bytes'),
-              getVMMetric(monitorClient, vm.id, 'OS Disk Queue Depth'),
-              getVMMetric(monitorClient, vm.id, 'Network In Total'),
-              getVMMetric(monitorClient, vm.id, 'Network Out Total'),
-            ]);
+          [
+            cpu,
+            memoryAvailableBytes,
+            diskQueueDepth,
+            networkInBytes,
+            networkOutBytes,
+          ] = await Promise.all([
+            getVMMetric(monitorClient, vm.id, 'Percentage CPU'),
+            getVMMetric(monitorClient, vm.id, 'Available Memory Bytes'),
+            getVMMetric(monitorClient, vm.id, 'OS Disk Queue Depth'),
+            getVMMetric(monitorClient, vm.id, 'Network In Total'),
+            getVMMetric(monitorClient, vm.id, 'Network Out Total'),
+          ]);
         }
 
-        // Convert memory bytes → percentage (approximate based on VM size)
-        // We use available bytes / total RAM; total RAM derived from VM size
+        // Convert available memory bytes → used percentage
+        // NOTE: vmSizeRamMap covers common SKUs; for full coverage query
+        //       computeClient.virtualMachineSizes.list(location) at startup.
         const vmSizeRamMap = {
-          'Standard_B1s': 1, 'Standard_B2s': 4, 'Standard_B4ms': 16,
-          'Standard_D2s_v3': 8, 'Standard_D4s_v3': 16, 'Standard_D8s_v3': 32,
-          'Standard_E4s_v4': 32, 'Standard_E8s_v4': 64,
-          'Standard_A2_v2': 4, 'Standard_DS2_v2': 7,
+          Standard_B1s: 1,
+          Standard_B2s: 4,
+          Standard_B4ms: 16,
+          Standard_D2s_v3: 8,
+          Standard_D4s_v3: 16,
+          Standard_D8s_v3: 32,
+          Standard_E4s_v4: 32,
+          Standard_E8s_v4: 64,
+          Standard_A2_v2: 4,
+          Standard_DS2_v2: 7,
+          Standard_D2_v3: 8,
+          Standard_D4_v3: 16,
+          Standard_D8_v3: 32,
+          Standard_F2s_v2: 4,
+          Standard_F4s_v2: 8,
+          Standard_F8s_v2: 16,
+          Standard_E16s_v4: 128,
+          Standard_E32s_v4: 256,
         };
         const totalRamGB = vmSizeRamMap[vm.hardwareProfile?.vmSize] ?? 8;
         const totalRamBytes = totalRamGB * 1024 * 1024 * 1024;
-        const memoryUsedPercent = memoryAvailableBytes !== null
-          ? Math.round(((totalRamBytes - memoryAvailableBytes) / totalRamBytes) * 100)
-          : 0;
+        const memoryUsedPercent =
+          memoryAvailableBytes !== null
+            ? Math.min(
+                100,
+                Math.round(
+                  ((totalRamBytes - memoryAvailableBytes) / totalRamBytes) * 100
+                )
+              )
+            : 0;
 
-        // Disk: convert queue depth to a rough 0-100 percentage
-        const diskPercent = diskQueueDepth !== null
-          ? Math.min(100, Math.round((diskQueueDepth / 100) * 100))
-          : 0;
+        // FIX: disk queue depth scaled to 0-100% using 50 as the danger threshold
+        // (was incorrectly dividing by 100 then multiplying by 100 — a no-op)
+        const diskPercent =
+          diskQueueDepth !== null
+            ? Math.min(100, Math.round((diskQueueDepth / 50) * 100))
+            : 0;
 
-        // Network in MB/s
-        const networkInMBs = networkInBytes !== null
-          ? Math.round(networkInBytes / (1024 * 1024 * 60)) // per minute → per second
-          : 0;
-        const networkOutMBs = networkOutBytes !== null
-          ? Math.round(networkOutBytes / (1024 * 1024 * 60))
-          : 0;
+        // FIX: Network In/Out Total is cumulative bytes over the 5-min window.
+        // Divide by interval seconds for true MB/s rate.
+        // (was dividing by 60 which gave MB/min, not MB/s as commented)
+        const INTERVAL_SECONDS = 5 * 60; // matches the 5-min timeRange in getVMMetric
+        const networkInMBs =
+          networkInBytes !== null
+            ? Math.round(networkInBytes / (1024 * 1024 * INTERVAL_SECONDS))
+            : 0;
+        const networkOutMBs =
+          networkOutBytes !== null
+            ? Math.round(networkOutBytes / (1024 * 1024 * INTERVAL_SECONDS))
+            : 0;
 
         const cpuRounded = Math.round(cpu ?? 0);
-        const alerts = await getAlertCount(monitorClient, subscriptionId, vm.name);
+        const alerts = await getAlertCount(alertsClient, vm.name);
         const status = deriveStatus(powerState, cpuRounded, memoryUsedPercent, diskPercent);
 
         vmList.push({
@@ -178,7 +238,9 @@ module.exports = async function (context, req) {
           region: vm.location,
           size: vm.hardwareProfile?.vmSize ?? 'Unknown',
           os: vm.storageProfile?.imageReference?.offer
-            ? `${vm.storageProfile.imageReference.offer} ${vm.storageProfile.imageReference.sku ?? ''}`.trim()
+            ? `${vm.storageProfile.imageReference.offer} ${
+                vm.storageProfile.imageReference.sku ?? ''
+              }`.trim()
             : 'Unknown',
           status,
           powerState,
@@ -189,12 +251,10 @@ module.exports = async function (context, req) {
             in: networkInMBs,
             out: networkOutMBs,
           },
-          uptime: isStopped ? '0h' : null, // Uptime requires Log Analytics query
           alerts,
           tags: Object.keys(vm.tags ?? {}).map(k => k.toLowerCase()),
           resourceGroup: resourceGroupName,
         });
-
       } catch (vmErr) {
         context.log.warn(`Skipping VM ${vm.name}: ${vmErr.message}`);
       }
@@ -210,7 +270,7 @@ module.exports = async function (context, req) {
       status: 200,
       headers: {
         'Content-Type': 'application/json',
-        'Cache-Control': 'no-cache, max-age=60', // cache for 60s
+        'Cache-Control': 'no-cache, max-age=60',
       },
       body: {
         subscription: subscriptionId,
@@ -219,7 +279,6 @@ module.exports = async function (context, req) {
         vms: vmList,
       },
     };
-
   } catch (err) {
     context.log.error('Fatal error fetching VMs:', err.message);
     context.res = {

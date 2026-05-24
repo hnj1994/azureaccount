@@ -6,7 +6,7 @@
       "value": "prod"
     },
     "location": {
-      "value": "eastus"
+      "value": "eastasia"
     },
     "uniqueSuffix": {
       "value": "abc01"
@@ -20,7 +20,7 @@
     "spClientSecret": {
       "reference": {
         "keyVault": {
-          "id": "/subscriptions/<SUB-ID>/resourceGroups/<RG>/providers/Microsoft.KeyVault/vaults/<EXISTING-KV>"
+          "id": "/subscriptions/<BOOTSTRAP-SUB-ID>/resourceGroups/<BOOTSTRAP-RG>/providers/Microsoft.KeyVault/vaults/<BOOTSTRAP-KV-NAME>"
         },
         "secretName": "sp-client-secret"
       }
@@ -28,7 +28,7 @@
     "anthropicApiKey": {
       "reference": {
         "keyVault": {
-          "id": "/subscriptions/<SUB-ID>/resourceGroups/<RG>/providers/Microsoft.KeyVault/vaults/<EXISTING-KV>"
+          "id": "/subscriptions/<BOOTSTRAP-SUB-ID>/resourceGroups/<BOOTSTRAP-RG>/providers/Microsoft.KeyVault/vaults/<BOOTSTRAP-KV-NAME>"
         },
         "secretName": "anthropic-api-key"
       }
