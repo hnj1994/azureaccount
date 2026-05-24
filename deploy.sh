@@ -11,18 +11,18 @@ set -e  # Exit on any error
 # CONFIGURATION — Edit these values before running
 # ---------------------------------------------------------------------------
 
-SUBSCRIPTION_ID="<YOUR-SUBSCRIPTION-ID>"
+SUBSCRIPTION_ID="03fb9f8e-2845-4ed8-ba85-9307e4699a43"
 RESOURCE_GROUP="rg-vmhealth-prod"
 LOCATION="eastus"
 UNIQUE_SUFFIX="abc01"          # 3-6 chars, lowercase alphanumeric
 ENVIRONMENT="prod"
 
 # Your Azure AD details
-TENANT_ID="<YOUR-TENANT-ID>"
+TENANT_ID="7bc034e8-6823-4a80-b537-0256adba45e7"
 
 # Secrets (will be stored in Key Vault — avoid hardcoding in production)
-SP_CLIENT_SECRET="<SERVICE-PRINCIPAL-CLIENT-SECRET>"
-ANTHROPIC_API_KEY="<YOUR-ANTHROPIC-API-KEY>"
+SP_CLIENT_SECRET="CSC8Q~oCKqXcS83M7KiKpGAaL8ZaU09v298Jba.X"
+ANTHROPIC_API_KEY="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"
 
 # ---------------------------------------------------------------------------
 # STEP 0 — Login and set subscription
