@@ -44,15 +44,41 @@ set -euo pipefail  # Exit on error, undefined vars, pipe failures
 # CONFIGURATION — Static values (non-secret). Override via env vars if needed.
 # ---------------------------------------------------------------------------
 
+<<<<<<< HEAD
 RESOURCE_GROUP="${RESOURCE_GROUP:-rg-vmhealth-prod}"
 LOCATION="${LOCATION:-eastasia}"
 UNIQUE_SUFFIX="${UNIQUE_SUFFIX:-abc01}"   # 3-6 lowercase alphanumeric
 ENVIRONMENT="${ENVIRONMENT:-prod}"
+=======
+echo "⚠️  SECURITY NOTICE: Never hardcode secrets in scripts!"
+echo ""
+echo "Enter your Azure configuration:"
+echo ""
+
+read -p "📌 Enter Subscription ID: " SUBSCRIPTION_ID
+read -p "📌 Enter Tenant ID: " TENANT_ID
+read -p "📌 Enter Resource Group name (default: rg-vmhealth-prod): " RESOURCE_GROUP
+RESOURCE_GROUP=${RESOURCE_GROUP:-"rg-vmhealth-prod"}
+
+read -p "📌 Enter Location (default: eastus): " LOCATION
+LOCATION=${LOCATION:-"eastus"}
+
+read -p "📌 Enter Unique Suffix 3-6 chars, lowercase alphanumeric (e.g., abc01): " UNIQUE_SUFFIX
+ENVIRONMENT="prod"
+
+# Secrets (will be stored in Key Vault — avoid hardcoding in production)
+read -sp "🔐 Enter Service Principal Client Secret: " SP_CLIENT_SECRET
+echo ""
+
+read -sp "🔐 Enter Anthropic API Key: " ANTHROPIC_API_KEY
+echo ""
+>>>>>>> 54b2fca5933b65967834627ba99826c54dea4380
 
 # ---------------------------------------------------------------------------
 # Validate required environment variables — fail fast with clear messages
 # ---------------------------------------------------------------------------
 
+<<<<<<< HEAD
 : "${SUBSCRIPTION_ID:?
   ❌ SUBSCRIPTION_ID is not set.
      Run: export SUBSCRIPTION_ID=\"<your-azure-subscription-id>\"}"
@@ -72,6 +98,10 @@ ENVIRONMENT="${ENVIRONMENT:-prod}"
 
 echo ""
 echo "🔐 Setting Azure subscription..."
+=======
+echo ""
+echo "🔐 Logging in to Azure..."
+>>>>>>> 54b2fca5933b65967834627ba99826c54dea4380
 az account set --subscription "$SUBSCRIPTION_ID"
 echo "✅ Subscription set: $SUBSCRIPTION_ID"
 
