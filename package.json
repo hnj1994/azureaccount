@@ -10,6 +10,10 @@
   "dependencies": {
     "@azure/arm-compute": "^21.3.0",
     "@azure/arm-monitor": "^7.0.0",
+<<<<<<< HEAD
+=======
+    "@azure/arm-alertsmanagement": "^1.0.0",
+>>>>>>> bc6414db139fbe778027871b86fd0b200a4659da
     "@azure/arm-resources": "^5.2.0",
     "@azure/identity": "^4.2.1"
   },
