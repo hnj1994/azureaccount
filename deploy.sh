@@ -10,82 +10,57 @@
 #   - Node.js >= 20
 #   - zip utility
 #
-# REQUIRED ENVIRONMENT VARIABLES
-#   Export these before running — do NOT hardcode secrets here.
-#
-#   SUBSCRIPTION_ID      Your Azure Subscription ID
-#   TENANT_ID            Your Azure AD Tenant ID
-#   ANTHROPIC_API_KEY    Your Anthropic API key (from console.anthropic.com)
-#
-# OPTIONAL ENVIRONMENT VARIABLES
-#   RESOURCE_GROUP       Defaults to: rg-vmhealth-prod
-#   LOCATION             Defaults to: eastasia
-#   UNIQUE_SUFFIX        Defaults to: abc01  (3-6 lowercase alphanumeric)
-#   ENVIRONMENT          Defaults to: prod
-#   SP_CLIENT_SECRET     Only required if the service principal already exists.
-#                        If creating a new SP, the secret is generated automatically.
-#
 # USAGE
-#   export SUBSCRIPTION_ID="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
-#   export TENANT_ID="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
-#   export ANTHROPIC_API_KEY="sk-ant-..."
 #   chmod +x deploy.sh
 #   ./deploy.sh
 #
+# The script will prompt you for all required values interactively.
+# Secrets are collected via silent prompts and never echoed to the terminal.
+#
 # SECURITY NOTE
-#   Never hardcode secrets or subscription IDs directly in this file.
-#   Use environment variables or a secrets manager (e.g. Azure Key Vault,
-#   GitHub Actions secrets, or a local .env file excluded from git).
+#   Never hardcode secrets or IDs directly in this file.
 # =============================================================================
 
 set -euo pipefail  # Exit on error, undefined vars, pipe failures
 
 # ---------------------------------------------------------------------------
-# CONFIGURATION — Static values (non-secret). Override via env vars if needed.
+# Interactive prompts — collect all inputs securely
 # ---------------------------------------------------------------------------
+
+echo ""
+echo "╔══════════════════════════════════════════════════════════════╗"
+echo "║     Azure VM Health Assistant — Deployment Setup            ║"
+echo "╚══════════════════════════════════════════════════════════════╝"
+echo ""
+echo "⚠️  Secrets are entered silently and never stored in this script."
+echo ""
+
+# Non-secret config
+read -rp "📌 Subscription ID: " SUBSCRIPTION_ID
+read -rp "📌 Tenant ID: " TENANT_ID
+read -rp "📌 Resource Group [rg-vmhealth-prod]: " RESOURCE_GROUP
 RESOURCE_GROUP="${RESOURCE_GROUP:-rg-vmhealth-prod}"
+read -rp "📌 Location [eastasia]: " LOCATION
 LOCATION="${LOCATION:-eastasia}"
-UNIQUE_SUFFIX="${UNIQUE_SUFFIX:-abc01}"   # 3-6 lowercase alphanumeric
-ENVIRONMENT="${ENVIRONMENT:-prod}"
-echo "⚠️  SECURITY NOTICE: Never hardcode secrets in scripts!"
-echo ""
-echo "Enter your Azure configuration:"
-echo ""
-
-read -p "📌 Enter Subscription ID: " SUBSCRIPTION_ID
-read -p "📌 Enter Tenant ID: " TENANT_ID
-read -p "📌 Enter Resource Group name (default: rg-vmhealth-prod): " RESOURCE_GROUP
-RESOURCE_GROUP=${RESOURCE_GROUP:-"rg-vmhealth-prod"}
-
-read -p "📌 Enter Location (default: eastasia): " LOCATION
-LOCATION=${LOCATION:-"eastasia"}
-
-read -p "📌 Enter Unique Suffix 3-6 chars, lowercase alphanumeric (e.g., abc01): " UNIQUE_SUFFIX
+read -rp "📌 Unique Suffix 3-6 chars [abc01]: " UNIQUE_SUFFIX
+UNIQUE_SUFFIX="${UNIQUE_SUFFIX:-abc01}"
 ENVIRONMENT="prod"
 
-# Secrets (will be stored in Key Vault — avoid hardcoding in production)
-read -sp "🔐 Enter Service Principal Client Secret: " SP_CLIENT_SECRET
+# Secrets — silent input
 echo ""
-
-read -sp "🔐 Enter Anthropic API Key: " ANTHROPIC_API_KEY
+read -rsp "🔐 Anthropic API Key (sk-ant-...): " ANTHROPIC_API_KEY
+echo ""
+read -rsp "🔐 SP Client Secret (leave blank if creating new SP): " SP_CLIENT_SECRET
 echo ""
 
 # ---------------------------------------------------------------------------
-# Validate required environment variables — fail fast with clear messages
+# Validate required inputs
 # ---------------------------------------------------------------------------
 
-: "${SUBSCRIPTION_ID:?
-  ❌ SUBSCRIPTION_ID is not set.
-     Run: export SUBSCRIPTION_ID=\"<your-azure-subscription-id>\"}"
-
-: "${TENANT_ID:?
-  ❌ TENANT_ID is not set.
-     Run: export TENANT_ID=\"<your-azure-tenant-id>\"}"
-
-: "${ANTHROPIC_API_KEY:?
-  ❌ ANTHROPIC_API_KEY is not set.
-     Run: export ANTHROPIC_API_KEY=\"sk-ant-...\"
-     Get your key from: https://console.anthropic.com}"
+: "${SUBSCRIPTION_ID:?❌ Subscription ID cannot be empty.}"
+: "${TENANT_ID:?❌ Tenant ID cannot be empty.}"
+: "${ANTHROPIC_API_KEY:?❌ Anthropic API Key cannot be empty.}"
+: "${UNIQUE_SUFFIX:?❌ Unique Suffix cannot be empty.}"
 
 # ---------------------------------------------------------------------------
 # STEP 0 — Set active Azure subscription
@@ -93,8 +68,6 @@ echo ""
 
 echo ""
 echo "🔐 Setting Azure subscription..."
-echo ""
-echo "🔐 Logging in to Azure..."
 az account set --subscription "$SUBSCRIPTION_ID"
 echo "✅ Subscription set: $SUBSCRIPTION_ID"
 
@@ -113,9 +86,6 @@ echo "✅ Resource group ready"
 
 # ---------------------------------------------------------------------------
 # STEP 2 — Create / reuse App Registration (idempotent)
-#
-# FIX: Was creating a new SP on every run, accumulating orphaned principals.
-#      Now checks if one already exists before creating.
 # ---------------------------------------------------------------------------
 
 SP_NAME="sp-vmhealth-${ENVIRONMENT}-${UNIQUE_SUFFIX}"
@@ -137,11 +107,10 @@ if [ -z "$EXISTING_SP_ID" ] || [ "$EXISTING_SP_ID" = "None" ]; then
 
   SP_CLIENT_ID=$(echo "$SP_OUTPUT" | jq -r '.appId')
 
-  # Use the auto-generated secret if SP_CLIENT_SECRET wasn't pre-set
+  # Use the auto-generated secret if SP_CLIENT_SECRET was not provided
   if [ -z "${SP_CLIENT_SECRET:-}" ]; then
     SP_CLIENT_SECRET=$(echo "$SP_OUTPUT" | jq -r '.password')
-    echo "   ℹ️  SP secret was auto-generated. Store it securely."
-    echo "      Secret will not be displayed again."
+    echo "   ℹ️  SP secret auto-generated. Store it securely — it will not be shown again."
   fi
 
   echo "✅ Service Principal created: $SP_CLIENT_ID"
@@ -149,10 +118,9 @@ else
   SP_CLIENT_ID="$EXISTING_SP_ID"
   echo "   Reusing existing Service Principal: $SP_CLIENT_ID"
 
-  # Existing SP — secret must be provided externally
   : "${SP_CLIENT_SECRET:?
-  ❌ Service Principal already exists but SP_CLIENT_SECRET is not set.
-     Export the client secret: export SP_CLIENT_SECRET=\"<secret>\"
+  ❌ Service Principal already exists but SP_CLIENT_SECRET is empty.
+     Re-run the script and enter the existing secret when prompted.
      Or rotate it: az ad sp credential reset --id $SP_CLIENT_ID}"
 
   echo "✅ Reusing existing Service Principal"
@@ -212,9 +180,6 @@ echo "   Key Vault:           $KEY_VAULT_NAME"
 
 # ---------------------------------------------------------------------------
 # STEP 5 — Update Function App CORS with actual SWA hostname
-#
-# FIX: The SWA hostname is auto-generated by Azure and cannot be predicted
-#      at Bicep deploy time. We update CORS here after the SWA is created.
 # ---------------------------------------------------------------------------
 
 echo ""
@@ -225,7 +190,6 @@ az functionapp cors add \
   --allowed-origins "https://${STATIC_WEB_APP_HOSTNAME}" \
   --output none
 
-# Remove the wildcard '*' origin that was set during initial deploy
 az functionapp cors remove \
   --name "$FUNCTION_APP_NAME" \
   --resource-group "$RESOURCE_GROUP" \
@@ -235,7 +199,7 @@ az functionapp cors remove \
 echo "✅ CORS updated — allowed origin: https://${STATIC_WEB_APP_HOSTNAME}"
 
 # ---------------------------------------------------------------------------
-# STEP 6 — Deploy RBAC at Subscription Scope (Monitoring Reader + Reader)
+# STEP 6 — Deploy RBAC at Subscription Scope
 # ---------------------------------------------------------------------------
 
 echo ""
@@ -297,19 +261,15 @@ echo "⚡  API Base URL:   $FUNCTION_APP_URL/api"
 echo "🔑  Key Vault:      https://portal.azure.com/#resource/subscriptions/$SUBSCRIPTION_ID/resourceGroups/$RESOURCE_GROUP/providers/Microsoft.KeyVault/vaults/$KEY_VAULT_NAME"
 echo ""
 echo "⚠️  Add these secrets to your GitHub repository:"
-echo "   Secret name:  AZURE_STATIC_WEB_APPS_API_TOKEN"
-echo "   Secret value: $SWA_TOKEN"
-echo ""
-echo "   Secret name:  REACT_APP_API_URL"
-echo "   Secret value: $FUNCTION_APP_URL/api"
+echo "   AZURE_STATIC_WEB_APPS_API_TOKEN = $SWA_TOKEN"
+echo "   REACT_APP_API_URL               = $FUNCTION_APP_URL/api"
 echo ""
 echo "📋 Next steps:"
 echo "   1. Add the secrets above to your GitHub repo"
 echo "   2. Push your React app — GitHub Actions will auto-deploy it"
 echo "   3. Visit $STATIC_WEB_APP_URL to view the dashboard"
 echo ""
-echo "⏳ RBAC note: Role propagation can take 5-15 minutes after deployment."
-echo "   If the Function App shows Key Vault errors on first cold start, wait"
-echo "   a few minutes then restart:"
+echo "⏳ RBAC note: Role propagation can take 5-15 minutes."
+echo "   If Function App shows Key Vault errors on first start, restart it:"
 echo "   az functionapp restart --name $FUNCTION_APP_NAME --resource-group $RESOURCE_GROUP"
 echo "============================================================"

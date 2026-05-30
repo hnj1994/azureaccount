@@ -27,6 +27,10 @@ local.settings.json
 node_modules
 dist
 
+# Deployment artifacts
+api-deploy.zip
+build/
+
 # Local python packages
 .python_packages/
 
